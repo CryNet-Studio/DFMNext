@@ -18,7 +18,7 @@ class DanmakuTouchHelper private constructor(
             MotionEvent.ACTION_UP -> {
                 val clickDanmakus = touchHitDanmaku(event.x, event.y)
                 var newestDanmaku: BaseDanmaku? = null
-                if (clickDanmakus != null && !clickDanmakus.isEmpty()) {
+                if (!clickDanmakus.isEmpty()) {
                     performClick(clickDanmakus)
                     newestDanmaku = fetchLatestOne(clickDanmakus)
                 }
@@ -47,11 +47,9 @@ class DanmakuTouchHelper private constructor(
             val iterator = danmakus.iterator()
             while (iterator.hasNext()) {
                 val danmaku = iterator.next()
-                if (danmaku != null) {
-                    mDanmakuBounds.set(danmaku.getLeft(), danmaku.getTop(), danmaku.getRight(), danmaku.getBottom())
-                    if (mDanmakuBounds.contains(x, y)) {
-                        hitDanmakus += danmaku
-                    }
+                mDanmakuBounds.set(danmaku.getLeft(), danmaku.getTop(), danmaku.getRight(), danmaku.getBottom())
+                if (mDanmakuBounds.contains(x, y)) {
+                    hitDanmakus += danmaku
                 }
             }
         }

@@ -90,7 +90,7 @@ class DanmakusRetainer {
 
                 while (!mCancelFixingFlag && it.hasNext()) {
                     lines++
-                    val item = it.next() ?: continue
+                    val item = it.next()
 
                     if (item == drawItem) {
                         insertItem = item
@@ -125,7 +125,7 @@ class DanmakusRetainer {
 
                 var checkEdge = true
                 if (insertItem != null) {
-                    topPos = if (lastItem != null) lastItem.getBottom() else insertItem.getTop()
+                    topPos = lastItem?.getBottom() ?: insertItem.getTop()
                     if (insertItem !== drawItem) {
                         removeItem = insertItem
                         shown = false
@@ -200,7 +200,7 @@ class DanmakusRetainer {
 
         override fun fix(drawItem: BaseDanmaku, disp: IDisplayer, verifier: Verifier?) {
             if (drawItem.isOutside()) return
-            var shown = drawItem.isShown()
+            val shown = drawItem.isShown()
             var topPos = drawItem.getTop()
             var lines = 0
             var willHit = !drawItem.isShown() && !mVisibleDanmakus.isEmpty()
@@ -216,7 +216,7 @@ class DanmakusRetainer {
                 val it = mVisibleDanmakus.iterator()
                 while (!mCancelFixingFlag && it.hasNext()) {
                     lines++
-                    val item = it.next() ?: continue
+                    val item = it.next()
 
                     if (item === drawItem) {
                         removeItem = null
