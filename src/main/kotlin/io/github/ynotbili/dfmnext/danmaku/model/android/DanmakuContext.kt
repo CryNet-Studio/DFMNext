@@ -1,6 +1,5 @@
 package io.github.ynotbili.dfmnext.danmaku.model.android
 
-import kotlin.reflect.KMutableProperty0
 import io.github.ynotbili.dfmnext.controller.DanmakuFilters
 import io.github.ynotbili.dfmnext.controller.DanmakuFilters.IDanmakuFilter
 import io.github.ynotbili.dfmnext.danmaku.model.AbsDisplayer
@@ -27,11 +26,27 @@ class DanmakuContext {
 
     var transparency: Int = BaseDanmaku.ALPHA_MAX
     var scaleTextSize: Float = 1.0f
-    var FTDanmakuVisibility: Boolean = true
-    var FBDanmakuVisibility: Boolean = true
-    var L2RDanmakuVisibility: Boolean = true
-    var R2LDanmakuVisibility: Boolean = true
-    var SpecialDanmakuVisibility: Boolean = true
+
+    /**
+     * Per-type visibility toggles. They are stored in [mFilterTypes] (the hidden
+     * set) rather than as five fields, so there is a single source of truth for
+     * the filter and no `KMutableProperty0` reflection hop per toggle.
+     */
+    var FTDanmakuVisibility: Boolean
+        get() = isTypeVisible(BaseDanmaku.TYPE_FIX_TOP)
+        set(visible) = setVisibilityAndUpdate(visible, BaseDanmaku.TYPE_FIX_TOP, DanmakuConfigTag.FT_DANMAKU_VISIBILITY)
+    var FBDanmakuVisibility: Boolean
+        get() = isTypeVisible(BaseDanmaku.TYPE_FIX_BOTTOM)
+        set(visible) = setVisibilityAndUpdate(visible, BaseDanmaku.TYPE_FIX_BOTTOM, DanmakuConfigTag.FB_DANMAKU_VISIBILITY)
+    var L2RDanmakuVisibility: Boolean
+        get() = isTypeVisible(BaseDanmaku.TYPE_SCROLL_LR)
+        set(visible) = setVisibilityAndUpdate(visible, BaseDanmaku.TYPE_SCROLL_LR, DanmakuConfigTag.L2R_DANMAKU_VISIBILITY)
+    var R2LDanmakuVisibility: Boolean
+        get() = isTypeVisible(BaseDanmaku.TYPE_SCROLL_RL)
+        set(visible) = setVisibilityAndUpdate(visible, BaseDanmaku.TYPE_SCROLL_RL, DanmakuConfigTag.R2L_DANMAKU_VISIBILITY)
+    var SpecialDanmakuVisibility: Boolean
+        get() = isTypeVisible(BaseDanmaku.TYPE_SPECIAL)
+        set(visible) = setVisibilityAndUpdate(visible, BaseDanmaku.TYPE_SPECIAL, DanmakuConfigTag.SPECIAL_DANMAKU_VISIBILITY)
 
     val mFilterTypes: MutableList<Int> = ArrayList()
     var refreshRateMS: Int = 15
@@ -72,27 +87,27 @@ class DanmakuContext {
     }
 
     fun setFTDanmakuVisibility(visible: Boolean): DanmakuContext {
-        setVisibilityAndUpdate(visible, BaseDanmaku.TYPE_FIX_TOP, ::FTDanmakuVisibility, DanmakuConfigTag.FT_DANMAKU_VISIBILITY)
+        FTDanmakuVisibility = visible
         return this
     }
 
     fun setFBDanmakuVisibility(visible: Boolean): DanmakuContext {
-        setVisibilityAndUpdate(visible, BaseDanmaku.TYPE_FIX_BOTTOM, ::FBDanmakuVisibility, DanmakuConfigTag.FB_DANMAKU_VISIBILITY)
+        FBDanmakuVisibility = visible
         return this
     }
 
     fun setL2RDanmakuVisibility(visible: Boolean): DanmakuContext {
-        setVisibilityAndUpdate(visible, BaseDanmaku.TYPE_SCROLL_LR, ::L2RDanmakuVisibility, DanmakuConfigTag.L2R_DANMAKU_VISIBILITY)
+        L2RDanmakuVisibility = visible
         return this
     }
 
     fun setR2LDanmakuVisibility(visible: Boolean): DanmakuContext {
-        setVisibilityAndUpdate(visible, BaseDanmaku.TYPE_SCROLL_RL, ::R2LDanmakuVisibility, DanmakuConfigTag.R2L_DANMAKU_VISIBILITY)
+        R2LDanmakuVisibility = visible
         return this
     }
 
     fun setSpecialDanmakuVisibility(visible: Boolean): DanmakuContext {
-        setVisibilityAndUpdate(visible, BaseDanmaku.TYPE_SPECIAL, ::SpecialDanmakuVisibility, DanmakuConfigTag.SPECIAL_DANMAKU_VISIBILITY)
+        SpecialDanmakuVisibility = visible
         return this
     }
 
@@ -153,12 +168,20 @@ class DanmakuContext {
         configChangedCallback = null
     }
 
-    private fun setVisibilityAndUpdate(visible: Boolean, type: Int, field: KMutableProperty0<Boolean>, tag: DanmakuConfigTag) {
+    private fun isTypeVisible(type: Int): Boolean = !mFilterTypes.contains(type)
+
+    /**
+     * [mFilterTypes] holds the *hidden* types, so it doubles as the storage for the
+     * visibility properties. The previous version kept a mirrored boolean per type
+     * and passed `::field` around as a [kotlin.reflect.KMutableProperty0] — one
+     * reflective call per toggle and two sources of truth that could disagree.
+     */
+    private fun setVisibilityAndUpdate(visible: Boolean, type: Int, tag: DanmakuConfigTag) {
+        val wasVisible = isTypeVisible(type)
         setDanmakuVisible(visible, type)
         setFilterData(DanmakuFilters.TAG_TYPE_DANMAKU_FILTER, mFilterTypes)
         mGlobalFlagValues.updateFilterFlag()
-        if (field.get() != visible) {
-            field.set(visible)
+        if (wasVisible != visible) {
             notifyConfigureChanged(tag, visible)
         }
     }

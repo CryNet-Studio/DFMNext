@@ -9,15 +9,14 @@ import android.util.AttributeSet
 import android.view.MotionEvent
 import android.view.View
 import android.view.ViewGroup
-import java.util.LinkedList
-import java.util.Locale
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.locks.ReentrantLock
 import io.github.ynotbili.dfmnext.controller.DrawHandler
 import io.github.ynotbili.dfmnext.controller.DrawHandler.Callback
 import io.github.ynotbili.dfmnext.controller.IDanmakuView
 import io.github.ynotbili.dfmnext.danmaku.model.BaseDanmaku
 import io.github.ynotbili.dfmnext.danmaku.util.clearCanvas
 import io.github.ynotbili.dfmnext.danmaku.util.drawFps
-import io.github.ynotbili.dfmnext.danmaku.util.useDrawColorToClear
 import io.github.ynotbili.dfmnext.danmaku.model.IDanmakus
 import io.github.ynotbili.dfmnext.danmaku.model.android.DanmakuContext
 import io.github.ynotbili.dfmnext.danmaku.parser.BaseDanmakuParser
@@ -34,6 +33,12 @@ class DanmakuView @JvmOverloads constructor(
         const val TAG = "DanmakuView"
         private const val MAX_RECORD_SIZE = 50
         private const val ONE_SECOND = 1000
+
+        /** How long the draw thread waits for one invalidated frame to be produced. */
+        private const val DRAW_HANDOFF_TIMEOUT_MS = 200L
+
+        /** Upper bound for shutting the handler thread down. */
+        private const val HANDLER_JOIN_TIMEOUT_MS = 500L
     }
 
     private var mCallback: Callback? = null
@@ -46,12 +51,23 @@ class DanmakuView @JvmOverloads constructor(
     private var mShowFps = false
     private var mDanmakuVisible = true
     protected var mDrawingThreadType = IDanmakuView.THREAD_TYPE_NORMAL_PRIORITY
-    @Suppress("PLATFORM_CLASS_MAPPED_TO_KOTLIN")
-    private val mDrawMonitor = Object()
+
+    /**
+     * Handoff between the draw thread (which blocks in [lockCanvas] until a
+     * frame has been produced) and the UI thread's `onDraw`. A `Lock` with a
+     * `Condition` replaces the raw monitor so the wait has a real timeout
+     * invariant and cannot be woken by an unrelated `notify()`.
+     */
+    private val mDrawLock = ReentrantLock()
+    private val mDrawCompleted = mDrawLock.newCondition()
     private var mDrawFinished = false
     private var mRequestRender = false
-    private var mUiThreadId = 0L
-    private var mDrawTimes: LinkedList<Long>? = null
+    /**
+     * The thread that created the view, i.e. the UI thread. Compared by identity
+     * instead of `Thread.getId()`, which is deprecated for removal.
+     */
+    private val mUiThread = Thread.currentThread()
+    private val mDrawTimes = ArrayDeque<Long>(MAX_RECORD_SIZE + 1)
     private var mClearFlag = false
     private var mResumeTryCount = 0
     private var mLastDrawDuration = 0L
@@ -75,13 +91,10 @@ class DanmakuView @JvmOverloads constructor(
     }
 
     init {
-        @Suppress("DEPRECATION")
-        mUiThreadId = Thread.currentThread().id
         setBackgroundColor(Color.TRANSPARENT)
-        useDrawColorToClear = true
         mTouchHelper = DanmakuTouchHelper.instance(this)
-        // Ensure the view is completely transparent to touch events
-        // so Compose gesture detectors (pinch-to-zoom etc.) can work
+        // Stay transparent to touch unless a click listener is registered, so
+        // gesture detectors on parent views keep receiving events.
         isClickable = false
         isLongClickable = false
         isFocusable = false
@@ -116,8 +129,7 @@ class DanmakuView @JvmOverloads constructor(
 
     override fun release() {
         stop()
-        mDrawTimes?.clear()
-        mDrawTimes = null
+        mDrawTimes.clear()
         mCallback = null
         mOnDanmakuClickListener = null
         mTouchHelper = null
@@ -132,21 +144,18 @@ class DanmakuView @JvmOverloads constructor(
         mHandler = null
         unlockCanvasAndPost()
         h?.quit()
-        // Wait a bit for the quit message to be processed
-        try {
-            Thread.sleep(50)
-        } catch (_: InterruptedException) {
-            Thread.currentThread().interrupt()
-        }
         val handlerThread = mHandlerThread
         if (handlerThread != null) {
             mHandlerThread = null
+            // quitSafely() first, then join: the looper exit is what ends the
+            // thread, so waiting before it (as the old code did, with a fixed
+            // Thread.sleep(50)) only added latency and could still race.
+            handlerThread.quitSafely()
             try {
-                handlerThread.join(500)
-            } catch (e: InterruptedException) {
+                handlerThread.join(HANDLER_JOIN_TIMEOUT_MS)
+            } catch (_: InterruptedException) {
                 Thread.currentThread().interrupt()
             }
-            handlerThread.quitSafely()
         }
     }
 
@@ -199,15 +208,10 @@ class DanmakuView @JvmOverloads constructor(
     }
 
     private fun fps(): Float {
-        val times = mDrawTimes ?: return 0f
-        val lastTime = SystemClock.uptimeMillis()
-        times.addLast(lastTime)
-        val dtime = (lastTime - times.first()).toFloat()
-        val frames = times.size
-        if (frames > MAX_RECORD_SIZE) {
-            times.removeFirst()
-        }
-        return if (dtime > 0) times.size * ONE_SECOND / dtime else 0.0f
+        mDrawTimes.addLast(SystemClock.uptimeMillis())
+        while (mDrawTimes.size > MAX_RECORD_SIZE) mDrawTimes.removeFirst()
+        val span = mDrawTimes.last() - mDrawTimes.first()
+        return if (span > 0) mDrawTimes.size * ONE_SECOND.toFloat() / span else 0f
     }
 
     override fun drawDanmakus(): Long {
@@ -227,19 +231,17 @@ class DanmakuView @JvmOverloads constructor(
     private fun lockCanvas() {
         if (!mDanmakuVisible) return
         postInvalidateCompat()
-        synchronized(mDrawMonitor) {
+        mDrawLock.lock()
+        try {
             while (!mDrawFinished && mHandler != null) {
-                try {
-                    mDrawMonitor.wait(200)
-                } catch (e: InterruptedException) {
-                    if (!mDanmakuVisible || mHandler == null || mHandler?.isStop() == true) {
-                        break
-                    } else {
-                        Thread.currentThread().interrupt()
-                    }
+                if (!mDanmakuVisible || mHandler?.isStop() == true) break
+                if (!mDrawCompleted.await(DRAW_HANDOFF_TIMEOUT_MS, TimeUnit.MILLISECONDS)) {
+                    break
                 }
             }
             mDrawFinished = false
+        } finally {
+            mDrawLock.unlock()
         }
     }
 
@@ -249,9 +251,12 @@ class DanmakuView @JvmOverloads constructor(
     }
 
     private fun unlockCanvasAndPost() {
-        synchronized(mDrawMonitor) {
+        mDrawLock.lock()
+        try {
             mDrawFinished = true
-            mDrawMonitor.notifyAll()
+            mDrawCompleted.signalAll()
+        } finally {
+            mDrawLock.unlock()
         }
     }
 
@@ -265,25 +270,30 @@ class DanmakuView @JvmOverloads constructor(
             canvas.clearCanvas()
             mClearFlag = false
         } else {
-            if (mHandler != null) {
-                val rs = mHandler?.draw(canvas) ?: return
-                if (mShowFps) {
-                    if (mDrawTimes == null) {
-                        mDrawTimes = LinkedList()
-                    }
-                    val fpsText = String.format(
-                        Locale.getDefault(),
-                        "fps %.2f,time:%d s,cache:%d,miss:%d",
-                        fps(), getCurrentTime() / 1000,
-                        rs.cacheHitCount, rs.cacheMissCount
-                    )
-                    canvas.drawFps(fpsText)
-                }
+            val handler = mHandler
+            if (handler != null) {
+                val rs = handler.draw(canvas)
+                if (mShowFps) canvas.drawFps(fpsText(rs))
             }
         }
         mLastDrawDuration = SystemClock.uptimeMillis() - drawStart
         mRequestRender = false
         unlockCanvasAndPost()
+    }
+
+    /**
+     * Debug overlay text. Built without `String.format`, which costs a format
+     * parse plus a locale lookup for every single frame.
+     */
+    private fun fpsText(rs: RenderingState): String =
+        "fps " + fps().formatFraction() +
+            ",time:" + (getCurrentTime() / 1000) + " s" +
+            ",cache:" + rs.cacheHitCount +
+            ",miss:" + rs.cacheMissCount
+
+    private fun Float.formatFraction(): String {
+        val scaled = (this * 100).toLong()
+        return (scaled / 100).toString() + "." + (scaled % 100).toString().padStart(2, '0')
     }
 
     override fun onLayout(changed: Boolean, left: Int, top: Int, right: Int, bottom: Int) {
@@ -344,16 +354,15 @@ class DanmakuView @JvmOverloads constructor(
         mHandler?.obtainMessage(DrawHandler.START, position)?.sendToTarget()
     }
 
-    override fun dispatchTouchEvent(event: MotionEvent): Boolean {
-        // Don't dispatch touch events to children or self
-        // This ensures Compose gesture detectors (pinch-to-zoom, etc.) can receive events
-        return false
-    }
+    /**
+     * Touch-transparent by design: hosts that embed this view (a Compose
+     * `AndroidView` with a sibling gesture detector, for instance) must keep
+     * receiving every event themselves, so nothing here may consume the
+     * sequence.
+     */
+    override fun dispatchTouchEvent(event: MotionEvent): Boolean = false
 
-    override fun onTouchEvent(event: MotionEvent): Boolean {
-        // Never consume touch events - let them propagate to Compose
-        return false
-    }
+    override fun onTouchEvent(event: MotionEvent): Boolean = false
 
     override fun seekTo(ms: Long?) {
         if (mHandler?.isPrepared() == true) {
@@ -403,7 +412,7 @@ class DanmakuView @JvmOverloads constructor(
 
     override fun clear() {
         if (!isViewReady()) return
-        if (!mDanmakuVisible || @Suppress("DEPRECATION") Thread.currentThread().id == mUiThreadId) {
+        if (!mDanmakuVisible || Thread.currentThread() === mUiThread) {
             mClearFlag = true
             postInvalidateCompat()
         } else {

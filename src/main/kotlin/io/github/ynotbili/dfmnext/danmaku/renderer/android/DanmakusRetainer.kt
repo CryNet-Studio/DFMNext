@@ -2,7 +2,6 @@ package io.github.ynotbili.dfmnext.danmaku.renderer.android
 
 import io.github.ynotbili.dfmnext.danmaku.model.BaseDanmaku
 import io.github.ynotbili.dfmnext.danmaku.model.IDisplayer
-import io.github.ynotbili.dfmnext.danmaku.model.android.Danmakus
 import io.github.ynotbili.dfmnext.danmaku.util.DanmakuUtils
 import io.github.ynotbili.dfmnext.danmaku.util.isScrollRL
 import io.github.ynotbili.dfmnext.danmaku.util.isScrollLR
@@ -10,6 +9,17 @@ import io.github.ynotbili.dfmnext.danmaku.util.isFixTop
 import io.github.ynotbili.dfmnext.danmaku.util.isFixBottom
 import io.github.ynotbili.dfmnext.danmaku.util.isSpecial
 
+/**
+ * Assigns a lane (vertical position) to each danmaku and tracks which lanes are
+ * occupied, so that scrolling comments do not overlap.
+ *
+ * The occupied-lane sets used to be `Danmakus` sorted by `getTop()` — a mutable
+ * key, because every scroll step changes it. Sorted containers with drifting
+ * keys need an identity fallback on every lookup and rebuild ordering on every
+ * insert; [Lanes] replaces that with a small array kept in lane order directly,
+ * inserted from the tail (where a new lane almost always belongs) and removed by
+ * identity.
+ */
 class DanmakusRetainer {
 
     private var rldrInstance: IDanmakusRetainer? = null
@@ -19,41 +29,52 @@ class DanmakusRetainer {
 
     fun fix(danmaku: BaseDanmaku, disp: IDisplayer, verifier: Verifier?) {
         when {
-            danmaku.isScrollRL -> {
-                if (rldrInstance == null) rldrInstance = RLDanmakusRetainer()
-                rldrInstance!!.fix(danmaku, disp, verifier)
-            }
-            danmaku.isScrollLR -> {
-                if (lrdrInstance == null) lrdrInstance = RLDanmakusRetainer()
-                lrdrInstance!!.fix(danmaku, disp, verifier)
-            }
-            danmaku.isFixTop -> {
-                if (ftdrInstance == null) ftdrInstance = FTDanmakusRetainer()
-                ftdrInstance!!.fix(danmaku, disp, verifier)
-            }
-            danmaku.isFixBottom -> {
-                if (fbdrInstance == null) fbdrInstance = FBDanmakusRetainer()
-                fbdrInstance!!.fix(danmaku, disp, verifier)
-            }
-            danmaku.isSpecial -> {
-                danmaku.layout(disp, 0f, 0f)
-            }
+            danmaku.isScrollRL -> RL.instance().fix(danmaku, disp, verifier)
+            danmaku.isScrollLR -> LR.instance().fix(danmaku, disp, verifier)
+            danmaku.isFixTop -> FT.instance().fix(danmaku, disp, verifier)
+            danmaku.isFixBottom -> FB.instance().fix(danmaku, disp, verifier)
+            danmaku.isSpecial -> danmaku.layout(disp, 0f, 0f)
         }
     }
 
+    /**
+     * One lazily created retainer per direction. Kept separate (rather than
+     * sharing the R2L retainer for L2R) so each direction tracks its own lane
+     * occupancy, as before.
+     */
+    private class Slot(val create: () -> IDanmakusRetainer) {
+
+        private var instance: IDanmakusRetainer? = null
+
+        fun instance(): IDanmakusRetainer = instance ?: create().also { instance = it }
+
+        fun clear() {
+            instance?.clear()
+        }
+
+        fun release() {
+            instance?.clear()
+            instance = null
+        }
+    }
+
+    private val RL = Slot { RLDanmakusRetainer() }
+    private val LR = Slot { RLDanmakusRetainer() }
+    private val FT = Slot { FTDanmakusRetainer() }
+    private val FB = Slot { FBDanmakusRetainer() }
+
     fun clear() {
-        rldrInstance?.clear()
-        lrdrInstance?.clear()
-        ftdrInstance?.clear()
-        fbdrInstance?.clear()
+        RL.clear()
+        LR.clear()
+        FT.clear()
+        FB.clear()
     }
 
     fun release() {
-        clear()
-        rldrInstance = null
-        lrdrInstance = null
-        ftdrInstance = null
-        fbdrInstance = null
+        RL.release()
+        LR.release()
+        FT.release()
+        FB.release()
     }
 
     interface Verifier {
@@ -65,9 +86,51 @@ class DanmakusRetainer {
         fun clear()
     }
 
+    /**
+     * Occupied lanes, ordered top to bottom (or bottom to top for the
+     * fixed-bottom retainer). Small by construction — one entry per usable line —
+     * so keeping it sorted on every insert is cheaper than the drifting mutable
+     * key ordering the previous `Danmakus(ST_BY_YPOS)` relied on.
+     */
+    private class Lanes(private val descending: Boolean) {
+
+        private val items = ArrayList<BaseDanmaku>(24)
+
+        private val order = Comparator<BaseDanmaku> { a, b ->
+            val result = compareValues(a.getTop(), b.getTop())
+            if (descending) -result else result
+        }
+
+        fun isEmpty(): Boolean = items.isEmpty()
+
+        fun clear() = items.clear()
+
+        operator fun get(index: Int): BaseDanmaku = items[index]
+
+        val size: Int get() = items.size
+
+        /** Re-inserts [item] in lane order, dropping any stale entry for it. */
+        fun add(item: BaseDanmaku) {
+            items.remove(item)
+            items.add(item)
+            // Only the tail can be out of place, so this is an insertion step.
+            var i = items.size - 1
+            while (i > 0 && order.compare(items[i - 1], items[i]) > 0) {
+                val tmp = items[i - 1]
+                items[i - 1] = items[i]
+                items[i] = tmp
+                i--
+            }
+        }
+
+        fun remove(item: BaseDanmaku) {
+            items.remove(item)
+        }
+    }
+
     private open class RLDanmakusRetainer : IDanmakusRetainer {
 
-        protected open val mVisibleDanmakus = Danmakus(Danmakus.ST_BY_YPOS)
+        protected open val mVisibleDanmakus = Lanes(descending = false)
         protected var mCancelFixingFlag = false
 
         override fun fix(drawItem: BaseDanmaku, disp: IDisplayer, verifier: Verifier?) {
@@ -76,33 +139,36 @@ class DanmakusRetainer {
             var lines = 0
             var willHit = !drawItem.isShown() && !mVisibleDanmakus.isEmpty()
             var isOutOfVerticalEdge = false
-            var shown = drawItem.isShown()
+            val shown = drawItem.isShown()
             var removeItem: BaseDanmaku? = null
 
             if (!shown) {
                 mCancelFixingFlag = false
-                val it = mVisibleDanmakus.iterator()
                 var insertItem: BaseDanmaku? = null
                 var firstItem: BaseDanmaku? = null
                 var lastItem: BaseDanmaku? = null
                 var minRightRow: BaseDanmaku? = null
                 var overwriteInsert = false
+                val currTime = drawItem.getTimer()!!.currMillisecond
+                val drawDuration = drawItem.getDuration()
+                val drawHeight = drawItem.paintHeight
+                val count = mVisibleDanmakus.size
+                var i = 0
 
-                while (!mCancelFixingFlag && it.hasNext()) {
+                while (!mCancelFixingFlag && i < count) {
                     lines++
-                    val item = it.next()
+                    val item = mVisibleDanmakus[i++]
 
-                    if (item == drawItem) {
+                    if (item === drawItem) {
                         insertItem = item
                         lastItem = null
-                        shown = true
                         willHit = false
                         break
                     }
 
                     if (firstItem == null) firstItem = item
 
-                    if (drawItem.paintHeight + item.getTop() > disp.height) {
+                    if (drawHeight + item.getTop() > disp.height) {
                         overwriteInsert = true
                         break
                     }
@@ -111,10 +177,7 @@ class DanmakusRetainer {
                         minRightRow = item
                     }
 
-                    willHit = DanmakuUtils.willHitInDuration(
-                        disp, item, drawItem,
-                        drawItem.getDuration(), drawItem.getTimer()!!.currMillisecond
-                    )
+                    willHit = DanmakuUtils.willHitInDuration(disp, item, drawItem, drawDuration, currTime)
                     if (!willHit) {
                         insertItem = item
                         break
@@ -128,32 +191,26 @@ class DanmakusRetainer {
                     topPos = lastItem?.getBottom() ?: insertItem.getTop()
                     if (insertItem !== drawItem) {
                         removeItem = insertItem
-                        shown = false
                     }
                 } else if (overwriteInsert && minRightRow != null) {
                     topPos = minRightRow.getTop()
                     checkEdge = false
-                    shown = false
                 } else if (lastItem != null) {
                     topPos = lastItem.getBottom()
                     willHit = false
                 } else if (firstItem != null) {
                     topPos = firstItem.getTop()
                     removeItem = firstItem
-                    shown = false
                 } else {
                     topPos = 0f
                 }
 
                 if (checkEdge) {
-                    isOutOfVerticalEdge = isOutVerticalEdge(overwriteInsert, drawItem, disp, topPos, firstItem, lastItem)
+                    isOutOfVerticalEdge = isOutVerticalEdge(drawItem, disp, topPos, firstItem)
                 }
                 if (isOutOfVerticalEdge) {
                     topPos = 0f
                     willHit = true
-                }
-                if (topPos == 0f) {
-                    shown = false
                 }
             }
 
@@ -166,16 +223,16 @@ class DanmakusRetainer {
             drawItem.layout(disp, drawItem.getLeft(), topPos)
 
             if (!shown) {
-                if (removeItem != null) mVisibleDanmakus -= removeItem
-                mVisibleDanmakus += drawItem
+                if (removeItem != null) mVisibleDanmakus.remove(removeItem)
+                mVisibleDanmakus.add(drawItem)
             }
         }
 
         protected open fun isOutVerticalEdge(
-            overwriteInsert: Boolean, drawItem: BaseDanmaku,
-            disp: IDisplayer, topPos: Float, firstItem: BaseDanmaku?, lastItem: BaseDanmaku?
+            drawItem: BaseDanmaku, disp: IDisplayer, topPos: Float, firstItem: BaseDanmaku?
         ): Boolean {
-            return topPos < 0 || (firstItem != null && firstItem.getTop() > 0) || topPos + drawItem.paintHeight > disp.height
+            return topPos < 0 || (firstItem != null && firstItem.getTop() > 0) ||
+                topPos + drawItem.paintHeight > disp.height
         }
 
         override fun clear() {
@@ -187,8 +244,7 @@ class DanmakusRetainer {
     private open class FTDanmakusRetainer : RLDanmakusRetainer() {
 
         override fun isOutVerticalEdge(
-            overwriteInsert: Boolean, drawItem: BaseDanmaku,
-            disp: IDisplayer, topPos: Float, firstItem: BaseDanmaku?, lastItem: BaseDanmaku?
+            drawItem: BaseDanmaku, disp: IDisplayer, topPos: Float, firstItem: BaseDanmaku?
         ): Boolean {
             return topPos + drawItem.paintHeight > disp.height
         }
@@ -196,7 +252,7 @@ class DanmakusRetainer {
 
     private class FBDanmakusRetainer : FTDanmakusRetainer() {
 
-        override val mVisibleDanmakus = Danmakus(Danmakus.ST_BY_YPOS_DESC)
+        override val mVisibleDanmakus = Lanes(descending = true)
 
         override fun fix(drawItem: BaseDanmaku, disp: IDisplayer, verifier: Verifier?) {
             if (drawItem.isOutside()) return
@@ -213,10 +269,15 @@ class DanmakusRetainer {
 
             if (!shown) {
                 mCancelFixingFlag = false
-                val it = mVisibleDanmakus.iterator()
-                while (!mCancelFixingFlag && it.hasNext()) {
+                val currTime = drawItem.getTimer()!!.currMillisecond
+                val drawDuration = drawItem.getDuration()
+                val drawHeight = drawItem.paintHeight
+                val count = mVisibleDanmakus.size
+                var i = 0
+
+                while (!mCancelFixingFlag && i < count) {
                     lines++
-                    val item = it.next()
+                    val item = mVisibleDanmakus[i++]
 
                     if (item === drawItem) {
                         removeItem = null
@@ -234,21 +295,18 @@ class DanmakusRetainer {
                         break
                     }
 
-                    willHit = DanmakuUtils.willHitInDuration(
-                        disp, item, drawItem,
-                        drawItem.getDuration(), drawItem.getTimer()!!.currMillisecond
-                    )
+                    willHit = DanmakuUtils.willHitInDuration(disp, item, drawItem, drawDuration, currTime)
                     if (!willHit) {
                         removeItem = item
                         break
                     }
 
-                    topPos = item.getTop() - drawItem.paintHeight
+                    topPos = item.getTop() - drawHeight
                 }
 
-                isOutOfVerticalEdge = isOutVerticalEdge(false, drawItem, disp, topPos, firstItem, null)
+                isOutOfVerticalEdge = isOutVerticalEdge(drawItem, disp, topPos, firstItem)
                 if (isOutOfVerticalEdge) {
-                    topPos = disp.height - drawItem.paintHeight
+                    topPos = disp.height - drawHeight
                     willHit = true
                 } else if (topPos >= 0) {
                     willHit = false
@@ -264,21 +322,15 @@ class DanmakusRetainer {
             drawItem.layout(disp, drawItem.getLeft(), topPos)
 
             if (!shown) {
-                if (removeItem != null) mVisibleDanmakus -= removeItem
-                mVisibleDanmakus += drawItem
+                if (removeItem != null) mVisibleDanmakus.remove(removeItem)
+                mVisibleDanmakus.add(drawItem)
             }
         }
 
         override fun isOutVerticalEdge(
-            overwriteInsert: Boolean, drawItem: BaseDanmaku,
-            disp: IDisplayer, topPos: Float, firstItem: BaseDanmaku?, lastItem: BaseDanmaku?
+            drawItem: BaseDanmaku, disp: IDisplayer, topPos: Float, firstItem: BaseDanmaku?
         ): Boolean {
             return topPos < 0 || (firstItem != null && firstItem.getBottom() != disp.height.toFloat())
-        }
-
-        override fun clear() {
-            mCancelFixingFlag = true
-            mVisibleDanmakus.clear()
         }
     }
 }

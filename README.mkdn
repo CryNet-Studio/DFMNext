@@ -8,7 +8,7 @@
 - **Bitmap 缓存** — 独立线程预渲染，LRU 淘汰，引用计数共享，超大弹幕自动分块
 - **滤镜系统** — 类型过滤、重复合并 (xN)、最大行数限制、防重叠
 - **碰撞避让** — 按类型的智能排版，滚动弹幕检测时间窗口内碰撞
-- **触摸响应** — 点击命中测试，支持返回单条或所有触碰弹幕
+- **触摸响应** — 点击命中测试，支持返回单条或所有触碰弹幕（注意：`DanmakuView` 对触摸是透传的，见下文）
 - **倍速播放** — `setSpeed(Float)` 变速不丢时间
 - **FPS 调试** — `showFPS(true)` 实时帧率/缓存命中统计
 
@@ -24,7 +24,7 @@ val context = DanmakuContext.create().apply {
 }
 
 // 2. 解析弹幕数据
-val parser = BiliDanmakuParser()
+val parser = BiliDanmukuParser()
 parser.load(AndroidFileSource(inputStream))
 parser.setConfig(context)
 val danmakus = parser.getDanmakus()
@@ -42,42 +42,46 @@ danmakuView.setCallback(object : DrawHandler.Callback {
 danmakuView.prepare(parser, context)
 
 // 4. 添加实时弹幕
-val d = DanmakuFactory.createDanmaku(BaseDanmaku.TYPE_SCROLL_RL, context)
+val d = context.mDanmakuFactory.createDanmaku(BaseDanmaku.TYPE_SCROLL_RL, context)!!
 d.text = "Hello World"
 d.textColor = Color.WHITE
 d.textSize = 25f
-d.setTime(danmakuView.currentTime)
+d.time = danmakuView.getCurrentTime()
 danmakuView.addDanmaku(d)
 ```
+
+这段是逐行编译验证过的。旧版文档里的三处写法在当前 API 下并不成立：XML 解析器类名是 `BiliDanmukuParser`（不是 `BiliDanmakuParser`）、`BaseDanmaku.time` 是 Kotlin 属性所以直接赋值而不是 `setTime(...)`、创建弹幕要用 `DanmakuContext.mDanmakuFactory` 实例而非静态方法。
 
 ## 解析器
 
 | 解析器 | 格式 |
 |---|---|
-| `BiliDanmakuParser` | Bilibili XML (`<d p="...">text</d>`) |
+| `BiliDanmukuParser` | Bilibili XML (`<d p="...">text</d>`) |
 | `BiliProtobufDanmakuParser` | Bilibili Protobuf（反射解析） |
 | `SpecialDanmakuParser` | 特殊弹幕 JSON 数组 |
 
-自定义解析器：继承 `BaseDanmakuParser`，实现 `parse(): IDanmakus?`，用 `DanmakuFactory.createDanmaku()` 创建弹幕实例。
+自定义解析器：继承 `BaseDanmakuParser`，实现 `protected abstract fun parse(): IDanmakus?`，用 `DanmakuContext.mDanmakuFactory.createDanmaku()` 创建弹幕实例。
 
 ## 渲染样式
 
 ```kotlin
 context.getDisplayer().apply {
-    setDanmakuStyle(AndroidDisplayer.DANMAKU_STYLE_STROKE, floatArrayOf(3.5f))  // 描边
-    setDanmakuStyle(AndroidDisplayer.DANMAKU_STYLE_SHADOW, floatArrayOf(4f))    // 阴影
-    setDanmakuStyle(AndroidDisplayer.DANMAKU_STYLE_PROJECTION, floatArrayOf(2f, 2f, 0.5f)) // 投影
+    setDanmakuStyle(IDisplayer.DANMAKU_STYLE_STROKEN, floatArrayOf(3.5f))     // 描边
+    setDanmakuStyle(IDisplayer.DANMAKU_STYLE_SHADOW, floatArrayOf(4f))        // 阴影
+    setDanmakuStyle(IDisplayer.DANMAKU_STYLE_PROJECTION, floatArrayOf(2f, 2f, 0.5f)) // 投影
     setTypeFace(typeface)
     setFakeBoldText(true)
 }
 ```
+
+样式常量定义在 `IDisplayer` 上，描边那一项的名字是 `DANMAKU_STYLE_STROKEN`。
 
 ## CacheStuffer
 
 默认 `SimpleTextCacheStuffer` 渲染纯文本。如需 HTML 富文本（`Spanned`），换用 `SpannedCacheStuffer`：
 
 ```kotlin
-context.getDisplayer().setCacheStuffer(SpannedCacheStuffer(), null)
+context.getDisplayer().setCacheStuffer(SpannedCacheStuffer())
 ```
 
 继承 `BaseCacheStuffer` 可自定义背景/描边/文字绘制逻辑。
@@ -109,6 +113,61 @@ io.github.ynotbili.dfmnext/
 ## 依赖
 
 运行时无外部依赖。测试使用 JUnit 5。
+
+## 性能优化（本轮改动）
+
+本轮不改行为、不加依赖，只重写热路径。改动集中在容器、缓存管理、排版避让、解析器和渲染循环。
+
+**数据结构。** `Danmakus` 从 `TreeSet` 改为二分插入的 `ArrayList`。`sub()` 返回一个 `Window`，它把可见区间一次性捕获成不可变数组并按代际复用：容器没变化时读取无锁、零分配，有插入时只复制可见区间这一小段。批量装载走一次 `sortWith`（`setItems`），淘汰走单次压缩（`removeWhere` / `removeHead` / `removeHeadWhile`），不再逐条 `removeItem` 触发数组搬移。
+
+**缓存管理线程。** 缓存池内存改为按条目记账，`mRealSize` 在插入时累加、销毁时归还，池上限因此真正生效；此前同一份缓存的引用计数变化会重复计费，池会无声涨过上限。构建线程不再在 `Handler` 里 `sleep`，每轮预算 8ms 后用 `sendMessageDelayed` 续排，节奏按屏幕前方剩余时长和上一帧耗时自适应。缓存复用改为内容键哈希索引，一次命中，替代原来的线性扫描。
+
+**碰撞避让。** 车道记录从 `Danmakus(ST_BY_YPOS)` 换成一个插入排序的小数组，每帧不再创建集合，也不再为每条弹幕分配 `Danmaku` 包装对象。四类弹幕的车道、绘制高度、当前时间等循环不变量提到循环外。
+
+**解析器。** XML 解析改用 `android.util.Xml.newPullParser()`，删掉 `XMLReaderFactory`（高版本平台已移除）和对全局 `org.xml.sax.driver` 系统属性的写入。Protobuf 反射字段按类缓存，不再每条弹幕重新 `getDeclaredField`。两个解析器偏好开关（高级弹幕、强制右滑）原先在元素循环里读取，现在每次解析读一次。`p` 属性按下标手工切分，不再 `split()`。解析异常时返回已解析到的部分结果，而不是整体丢弃。
+
+**渲染循环。** 弹幕比较函数不再对两侧 `text.toString()`，10k 条的一次排序原先要生成数万个临时字符串。类型可见性过滤从加锁 `List.contains` 改成一个位掩码读取。渲染器去掉了每帧的 `HashSet<Long>` 去重表和临时列表，绘制逻辑抽成复用方法，循环内不再重复取 `mContext` 字段。`DanmakuView`/`DrawHandler`/`UpdateThread` 的 `Object` 监视器换成 `ReentrantLock` + `Condition`，更新线程不再空转，停止时 `join` 有超时上限；FPS 文本手工拼装，不走 `String.format`。
+
+**现代 API 与规范。** `StaticLayout.Builder`（API 23 以上）替代已废弃构造函数；触摸命中改用 `event.actionMasked`；`Thread.id` 改用线程对象身份；`Math.sqrt/abs` → `kotlin.math`；`IOUtils` 显式 UTF-8 并用 `use` / `copyTo`；`DanmakuContext` 去掉 `KMutableProperty0` 反射跳转，可见性开关统一以隐藏类型集合为唯一事实来源；`AndroidFileSource` 修正 http(s) 用 `uri.path` 拼 URL 的错误（应为 `uri.toString()`）以及 `File(uri.path)` 的空安全。同时修掉几个真实缺陷：`DanmakuUtils.fillText` 的栈溢出、`SpecialDanmaku` 距离计算的浮点往返、绘制缓存超预算时悬挂的引用计数。
+
+### 基准数据
+
+`src/test/.../bench/ContainerBenchmark.kt` 把旧的 `TreeSet` 实现原样留在测试源码里做对照，测的是引擎真正跑的三条路径：批量装载、每帧时间窗口、缓存淘汰。JVM 微基准（不是真机 profile），20 轮预热 + 9 轮取中位数，同时报每操作字节分配量：
+
+```
+./gradlew testDebugUnitTest -Ddfm.bench=true
+```
+
+结果同时打印到测试日志和 `build/reports/bench/container.txt`。不加 `-Ddfm.bench=true` 时该基准自动跳过，不影响常规 `test`。
+
+窗口那一行的测量方式需要说明，因为它纠正了本仓库先前给出过的数字。`DrawTask` 并不是每帧重建时间窗口——它复用一个 `Window`，只有当游标越过边界时才重新解析（10k 条、600 帧的一次播放只有约 23 次重建）。基准因此照搬这个判断条件，而不是每帧调用一次 `sub()`：否则量到的是真实渲染器根本不会做的拷贝，只会偏袒拷贝更多的那一侧。
+
+10k 条、三次独立运行（分配量在各次运行间完全一致，速度取观测区间）：
+
+| 场景 | 速度 | 分配/帧（或/操作） |
+|---|---|---|
+| 解析装载：一次 `sortWith` vs n 次树插入 | 10–17x | 40 B → 8 B |
+| 缓存淘汰（整批压缩 vs 逐条删除） | 9–20x | 33 B → 6 B |
+| 每帧时间窗口遍历（含复用） | 1.5–2.0x | 982 B → 291 B |
+| 实时逐条追加（时间有序） | 1.4–1.6x | 40 B → 14 B |
+| 实时逐条追加（轻微乱序） | 1.1–1.4x | 40 B → 14 B |
+| 实时逐条追加（完全乱序，最坏情况） | 0.5x | 40 B → 14 B |
+| 逐条删除 `removeItem` | 0.5–0.6x（不更快） | 33 B → 12 B |
+
+2k 条时窗口那一行是 162–226 B → 75 B，速度 0.5–1.0x（旧实现在这个规模上抖动很大，同一份代码三次运行 1599–9468 ns）；规模小的时候两边都没什么差别。
+
+三点值得单列。一是真正稳定的收益在分配量而不在纳秒：窗口遍历每帧从约 1 KB 降到约 290 B，装载和淘汰的每操作分配降到四分之一到七分之一——分配压力才是手机上变成 GC 停顿和掉帧的那一项，而 JVM 微基准的耗时本身可复现性差。二是逐条删除确实不比 `TreeSet` 快，本轮的收益来自把淘汰改成批量接口（`removeWhere` / `removeHead`），缓存管理器和 `DrawTask` 都已改走批量路径；单条删除只剩捐赠者摘除这类低频场景，那里 12 B 对 33 B 的分配优势比纳秒有意义。三是完全乱序追加慢于树结构是数组容器的固有代价（搬移 vs 旋转），真实投递流是时间有序的，故按最坏情况如实列出而不隐藏。
+
+### 兼容性说明
+
+公开 API 基本不变，以下几处需要调用方注意：
+
+- `Danmakus.items` 字段移除（内部数组不再暴露）；`setItems` 参数类型放宽为 `Collection<BaseDanmaku>?`。
+- `CacheManager.buildCacheForItem()` / `push()` / `preRenderFirstScreen()` 不再公开。`preRenderFirstScreen` 在旧版本就没有调用点；缓存构建请使用 `requestBuild()`。
+- `IOUtils.closeQuietly(InputStream?)` / `closeQuietly(OutputStream?)` 合并为 `closeQuietly(Closeable?)`。
+- `BaseDanmakuParser` 新增 `advancedDanmakuEnabled` / `forceRightToLeftScroll` 两个可直接赋值的开关；`sharedPreferences` 仍然保留，但只在每次解析开始时读一次。
+- 特殊弹幕帧内绘制上限（50）与单帧渲染预算（12ms）由字面量改为具名常量，数值未变。
+- `DanmakuView` 对触摸保持透传（`dispatchTouchEvent` / `onTouchEvent` 一律返回 `false`），这是嵌入 Compose `AndroidView` 并带有同级手势检测器的主机（缩放、拖动）正常工作的前提，本轮维持该约定。代价是内置的点击命中测试默认收不到事件：需要在弹幕层做点击的调用方，请用自己的手势检测器调用公开的 `DanmakuTouchHelper.instance(view).onTouchEvent(event)`。
 
 ## License
 

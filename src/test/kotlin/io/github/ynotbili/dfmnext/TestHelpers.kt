@@ -35,7 +35,7 @@ class TestDanmaku(
         lx = x; ly = y; rx = x + paintWidth; by = y + paintHeight
     }
 
-    override fun getRectAtTime(displayer: IDisplayer, time: Long): FloatArray? =
+    override fun getRectAtTime(displayer: IDisplayer, currTime: Long): FloatArray? =
         floatArrayOf(lx, ly, rx, by)
 
     override fun getLeft(): Float = lx
