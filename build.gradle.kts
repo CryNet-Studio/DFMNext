@@ -38,4 +38,7 @@ dependencies {
 
 tasks.withType<Test> {
     useJUnitPlatform()
+    // Forwarded so `gradle test -Ddfm.bench=true` can opt into the container
+    // benchmark without editing the build script.
+    System.getProperty("dfm.bench")?.let { systemProperty("dfm.bench", it) }
 }

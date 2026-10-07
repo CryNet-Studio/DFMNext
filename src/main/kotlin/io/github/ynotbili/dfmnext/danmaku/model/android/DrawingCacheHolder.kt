@@ -75,8 +75,8 @@ class DrawingCacheHolder {
         if (width <= 0 || height <= 0 || bitmap == null) return
         if (width <= maximumCacheWidth && height <= maximumCacheHeight) return
 
-        val effectiveMaxWidth = Math.min(maximumCacheWidth, dispWidth)
-        val effectiveMaxHeight = Math.min(maximumCacheHeight, dispHeight)
+        val effectiveMaxWidth = minOf(maximumCacheWidth, dispWidth)
+        val effectiveMaxHeight = minOf(maximumCacheHeight, dispHeight)
         val xCount = width / effectiveMaxWidth + if (width % effectiveMaxWidth == 0) 0 else 1
         val yCount = height / effectiveMaxHeight + if (height % effectiveMaxHeight == 0) 0 else 1
         val averageWidth = width / xCount

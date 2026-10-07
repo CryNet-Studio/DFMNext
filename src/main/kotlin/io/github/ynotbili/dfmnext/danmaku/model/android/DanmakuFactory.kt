@@ -136,8 +136,7 @@ class DanmakuFactory protected constructor() {
             CURRENT_DISP_SIZE_FACTOR != viewportSizeFactor
         ) {
             REAL_DANMAKU_DURATION = (COMMON_DANMAKU_DURATION * (viewportSizeFactor * viewportWidth / BILI_PLAYER_WIDTH)).toLong()
-            REAL_DANMAKU_DURATION = Math.min(MAX_DANMAKU_DURATION_HIGH_DENSITY, REAL_DANMAKU_DURATION)
-            REAL_DANMAKU_DURATION = Math.max(MIN_DANMAKU_DURATION, REAL_DANMAKU_DURATION)
+            REAL_DANMAKU_DURATION = REAL_DANMAKU_DURATION.coerceIn(MIN_DANMAKU_DURATION, MAX_DANMAKU_DURATION_HIGH_DENSITY)
 
             CURRENT_DISP_WIDTH = viewportWidth.toInt()
             CURRENT_DISP_HEIGHT = viewportHeight.toInt()

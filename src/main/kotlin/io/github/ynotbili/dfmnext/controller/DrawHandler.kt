@@ -15,6 +15,8 @@ import io.github.ynotbili.dfmnext.danmaku.parser.BaseDanmakuParser
 import io.github.ynotbili.dfmnext.danmaku.renderer.IRenderer.RenderingState
 import io.github.ynotbili.dfmnext.danmaku.util.AndroidUtils
 import io.github.ynotbili.dfmnext.danmaku.util.SystemClock
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.locks.ReentrantLock
 
 class DrawHandler(
     looper: Looper,
@@ -44,13 +46,14 @@ class DrawHandler(
     }
 
     companion object {
-        val START = Msg.START.what
-        val UPDATE = Msg.UPDATE.what
-        val RESUME = Msg.RESUME.what
-        val SEEK_POS = Msg.SEEK_POS.what
-        val PREPARE = Msg.PREPARE.what
+        @JvmField val START = Msg.START.what
+        @JvmField val UPDATE = Msg.UPDATE.what
+        @JvmField val RESUME = Msg.RESUME.what
+        @JvmField val SEEK_POS = Msg.SEEK_POS.what
+        @JvmField val PREPARE = Msg.PREPARE.what
         private const val INDEFINITE_TIME = 10000000L
         private const val MAX_RECORD_SIZE = 500
+        private const val THREAD_JOIN_TIMEOUT_MS = 500L
     }
 
     private var pausedPosition = 0L
@@ -61,8 +64,15 @@ class DrawHandler(
     val timer = DanmakuTimer()
     private var mParser: BaseDanmakuParser? = null
     var drawTask: IDrawTask? = null
-    @Suppress("PLATFORM_CLASS_MAPPED_TO_KOTLIN")
-    private val mDrawTaskMonitor = Object()
+
+    /**
+     * Idle handshake for the update thread. The previous implementation waited
+     * on a plain `Object` monitor and, worse, spun with `SystemClock.sleep(1)`
+     * in front of it — roughly a thousand wakeups a second while nothing was
+     * changing. A `Condition` gives one interruptible, deadline-based wait.
+     */
+    private val mDrawLock = ReentrantLock()
+    private val mRenderingIdle = mDrawLock.newCondition()
     private var mDanmakuView: IDanmakuView? = null
     private var mDanmakusVisible = true
     private var mDisp: AbsDisplayer? = null
@@ -73,20 +83,15 @@ class DrawHandler(
     private var mCordonTime = 30L
     private var mCordonTime2 = 60L
     private var mFrameUpdateRate = 16L
-    @Suppress("unused")
-    private var mThresholdTime = 0L
     private var mLastDeltaTime = 0L
     @Volatile private var mInSeekingAction = false
     private var mDesireSeekingTime = 0L
     @Volatile private var mRemainingTime = 0L
     private var mInSyncAction = false
     @Volatile private var mInWaitingState = false
-    private val mIdleSleep: Boolean =
-        true // DeviceUtils.isProblemBoxDevice() replaced: assume not a problem device
     private var mSpeedOffsetNoRender = 0L
     private var mSpeedOffsetRender = 0L
     private var mSpeed = 1.0f
-    private var mAdaptiveConfigDone = false
 
     init {
         bindView(view)
@@ -281,13 +286,11 @@ class DrawHandler(
     private fun quitUpdateThread() {
         val thread = mThread ?: return
         mThread = null
-        thread.quit()  // Set the quit flag for UpdateThread
-        synchronized(mDrawTaskMonitor) {
-            mDrawTaskMonitor.notifyAll()
-        }
+        thread.quit()
+        wakeUpRendering()
         try {
-            thread.join(500)
-        } catch (e: InterruptedException) {
+            thread.join(THREAD_JOIN_TIMEOUT_MS)
+        } catch (_: InterruptedException) {
             Thread.currentThread().interrupt()
         }
     }
@@ -311,7 +314,7 @@ class DrawHandler(
         if (!mDanmakusVisible) {
             waitRendering(INDEFINITE_TIME)
             return
-        } else if (mRenderingState.nothingRendered && mIdleSleep) {
+        } else if (mRenderingState.nothingRendered) {
             val dTime = mRenderingState.endTime - timer.currMillisecond
             if (dTime > 500) {
                 waitRendering(dTime - 10)
@@ -330,31 +333,32 @@ class DrawHandler(
         mThread = object : UpdateThread("DFM Update") {
             override fun run() {
                 var lastTime = SystemClock.uptimeMillis()
-                var dTime = 0L
                 while (!isQuited() && !quitFlag) {
                     val startMS = SystemClock.uptimeMillis()
-                    dTime = SystemClock.uptimeMillis() - lastTime
-                    val diffTime = mFrameUpdateRate - dTime
-                    if (diffTime > 1) {
-                        SystemClock.sleep(1)
+                    val timeToNextFrame = mFrameUpdateRate - (startMS - lastTime)
+                    if (timeToNextFrame > 0) {
+                        // One timed wait instead of the old `SystemClock.sleep(1)`
+                        // spin: same pacing, ~1000 fewer wakeups per second, and a
+                        // seek or pause interrupts it immediately.
+                        if (!idleWait(timeToNextFrame)) break
                         continue
                     }
                     lastTime = startMS
                     var d = syncTimer(startMS)
                     if (d < 0) {
-                        SystemClock.sleep(60 - d)
+                        if (!idleWait(60 - d)) break
                         continue
                     }
                     val view = mDanmakuView ?: break
                     d = view.drawDanmakus()
                     if (d > mCordonTime2) {
                         timer.add(d)
-                        mDrawTimes.clear()
+                        clearDrawTimes()
                     }
                     if (!mDanmakusVisible) {
                         waitRendering(INDEFINITE_TIME)
-                    } else if (mRenderingState.nothingRendered && mIdleSleep) {
-                        dTime = mRenderingState.endTime - timer.currMillisecond
+                    } else if (mRenderingState.nothingRendered) {
+                        val dTime = mRenderingState.endTime - timer.currMillisecond
                         if (dTime > 500) {
                             notifyRendering()
                             waitRendering(dTime - 10)
@@ -364,6 +368,31 @@ class DrawHandler(
             }
         }
         mThread!!.start()
+    }
+
+    /**
+     * Interruptible wait on the render/idle handshake. Returns false when the
+     * thread should stop (quit flag set, or interrupted while unwinding).
+     */
+    private fun idleWait(mills: Long): Boolean {
+        mDrawLock.lock()
+        try {
+            mRenderingIdle.await(mills, TimeUnit.MILLISECONDS)
+        } catch (_: InterruptedException) {
+            Thread.currentThread().interrupt()
+        } finally {
+            mDrawLock.unlock()
+        }
+        return !quitFlag
+    }
+
+    private fun clearDrawTimes() {
+        mDrawLock.lock()
+        try {
+            mDrawTimes.clear()
+        } finally {
+            mDrawLock.unlock()
+        }
     }
 
     fun setSpeed(speed: Float) {
@@ -423,7 +452,6 @@ class DrawHandler(
         mCordonTime = maxOf(33, (averageFrameConsumingTime * 2.5f).toLong())
         mCordonTime2 = (mCordonTime * 2.5f).toLong()
         mFrameUpdateRate = maxOf(16, averageFrameConsumingTime / 15 * 15)
-        mThresholdTime = mFrameUpdateRate + 3
     }
 
     private fun prepare(runnable: Runnable) {
@@ -582,13 +610,8 @@ class DrawHandler(
         if (!mInWaitingState) return
         drawTask?.requestClear()
         if (mUpdateInNewThread) {
-            synchronized(this) {
-                mDrawTimes.clear()
-            }
-            synchronized(mDrawTaskMonitor) {
-                mDrawTaskMonitor.notifyAll()
-            }
-            mDrawTimes.clear()
+            clearDrawTimes()
+            wakeUpRendering()
             removeMessages(UPDATE)
             sendEmptyMessage(UPDATE)
         } else {
@@ -598,52 +621,41 @@ class DrawHandler(
         mInWaitingState = false
     }
 
+    private fun wakeUpRendering() {
+        mDrawLock.lock()
+        try {
+            mRenderingIdle.signalAll()
+        } finally {
+            mDrawLock.unlock()
+        }
+    }
+
     private fun waitRendering(dTime: Long) {
         mRenderingState.sysTime = SystemClock.uptimeMillis()
         mInWaitingState = true
         if (mUpdateInNewThread) {
             if (mThread == null) return
+            mDrawLock.lock()
             try {
-                synchronized(mDrawTaskMonitor) {
-                    if (dTime == INDEFINITE_TIME) {
-                        mDrawTaskMonitor.wait()
-                    } else {
-                        mDrawTaskMonitor.wait(dTime)
+                if (dTime == INDEFINITE_TIME) {
+                    while (mInWaitingState && !quitFlag) {
+                        mRenderingIdle.await()
                     }
-                    sendEmptyMessage(Msg.NOTIFY_RENDERING.what)
+                } else {
+                    mRenderingIdle.await(dTime, TimeUnit.MILLISECONDS)
                 }
-            } catch (e: InterruptedException) {
+            } catch (_: InterruptedException) {
                 Thread.currentThread().interrupt()
+            } finally {
+                mDrawLock.unlock()
             }
+            sendEmptyMessage(Msg.NOTIFY_RENDERING.what)
         } else {
-            if (dTime == INDEFINITE_TIME) {
-                removeMessages(Msg.NOTIFY_RENDERING.what)
-                removeMessages(UPDATE)
-            } else {
-                removeMessages(Msg.NOTIFY_RENDERING.what)
-                removeMessages(UPDATE)
+            removeMessages(Msg.NOTIFY_RENDERING.what)
+            removeMessages(UPDATE)
+            if (dTime != INDEFINITE_TIME) {
                 sendEmptyMessageDelayed(Msg.NOTIFY_RENDERING.what, dTime)
             }
-        }
-    }
-
-    @Synchronized
-    private fun getAverageRenderingTime(): Long {
-        val frames = mDrawTimes.size
-        if (frames <= 0) return 0
-        return try {
-            val dtime = mDrawTimes.last() - mDrawTimes.first()
-            val avg = dtime / frames
-            if (!mAdaptiveConfigDone && frames >= 30 && avg > 16) {
-                mCordonTime = maxOf(33, (avg * 2.5f).toLong())
-                mCordonTime2 = (mCordonTime * 2.5f).toLong()
-                mFrameUpdateRate = maxOf(16, avg / 15 * 15)
-                mThresholdTime = mFrameUpdateRate + 3
-                mAdaptiveConfigDone = true
-            }
-            avg
-        } catch (e: Exception) {
-            0
         }
     }
 
@@ -651,10 +663,8 @@ class DrawHandler(
     private fun recordRenderingTime() {
         val lastTime = SystemClock.uptimeMillis()
         mDrawTimes.addLast(lastTime)
-        var frames = mDrawTimes.size
-        if (frames > MAX_RECORD_SIZE) {
+        while (mDrawTimes.size > MAX_RECORD_SIZE) {
             mDrawTimes.removeFirst()
-            frames = MAX_RECORD_SIZE
         }
     }
 

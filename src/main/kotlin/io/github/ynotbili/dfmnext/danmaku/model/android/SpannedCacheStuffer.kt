@@ -2,11 +2,13 @@ package io.github.ynotbili.dfmnext.danmaku.model.android
 
 import android.graphics.Canvas
 import android.graphics.Paint
+import android.os.Build
 import android.text.Layout
 import android.text.Spanned
 import android.text.StaticLayout
 import android.text.TextPaint
 import java.lang.ref.SoftReference
+import kotlin.math.ceil
 import io.github.ynotbili.dfmnext.danmaku.model.BaseDanmaku
 
 class SpannedCacheStuffer : SimpleTextCacheStuffer() {
@@ -16,10 +18,9 @@ class SpannedCacheStuffer : SimpleTextCacheStuffer() {
             mProxy?.prepareDrawing(danmaku, fromWorkerThread)
             val text = danmaku.text
             if (text != null) {
-                val staticLayout = StaticLayout(
+                val staticLayout = newLayout(
                     text, paint,
-                    Math.ceil(StaticLayout.getDesiredWidth(danmaku.text, paint).toDouble()).toInt(),
-                    Layout.Alignment.ALIGN_NORMAL, 1.0f, 0.0f, true
+                    ceil(StaticLayout.getDesiredWidth(text, paint).toDouble()).toInt()
                 )
                 danmaku.paintWidth = staticLayout.width.toFloat()
                 danmaku.paintHeight = staticLayout.height.toFloat()
@@ -57,20 +58,16 @@ class SpannedCacheStuffer : SimpleTextCacheStuffer() {
             val text = danmaku.text
             if (text != null) {
                 staticLayout = if (requestRemeasure) {
-                    val layout = StaticLayout(
+                    val layout = newLayout(
                         text, paint,
-                        Math.ceil(StaticLayout.getDesiredWidth(danmaku.text, paint).toDouble()).toInt(),
-                        Layout.Alignment.ALIGN_NORMAL, 1.0f, 0.0f, true
+                        ceil(StaticLayout.getDesiredWidth(text, paint).toDouble()).toInt()
                     )
                     danmaku.paintWidth = layout.width.toFloat()
                     danmaku.paintHeight = layout.height.toFloat()
                     danmaku.requestFlags = danmaku.requestFlags and BaseDanmaku.FLAG_REQUEST_REMEASURE.inv()
                     layout
                 } else {
-                    StaticLayout(
-                        text, paint, danmaku.paintWidth.toInt(),
-                        Layout.Alignment.ALIGN_NORMAL, 1.0f, 0.0f, true
-                    )
+                    newLayout(text, paint, danmaku.paintWidth.toInt())
                 }
                 danmaku.obj = SoftReference(staticLayout)
             } else {
@@ -105,5 +102,28 @@ class SpannedCacheStuffer : SimpleTextCacheStuffer() {
     override fun releaseResource(danmaku: BaseDanmaku) {
         clearCache(danmaku)
         super.releaseResource(danmaku)
+    }
+
+    /**
+     * `StaticLayout.Builder` is the supported entry point since API 23; the
+     * seven-argument constructor is deprecated and, on newer platforms, just
+     * forwards to the builder anyway. Below API 23 the constructor is the only
+     * option, so the call is kept as the fallback.
+     */
+    private fun newLayout(source: CharSequence, paint: TextPaint, width: Int): StaticLayout {
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            StaticLayout.Builder
+                .obtain(source, 0, source.length, paint, width)
+                .setAlignment(Layout.Alignment.ALIGN_NORMAL)
+                .setLineSpacing(0.0f, 1.0f)
+                .setIncludePad(true)
+                .build()
+        } else {
+            @Suppress("DEPRECATION")
+            StaticLayout(
+                source, paint, width,
+                Layout.Alignment.ALIGN_NORMAL, 1.0f, 0.0f, true
+            )
+        }
     }
 }

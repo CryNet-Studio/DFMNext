@@ -1,12 +1,15 @@
 package io.github.ynotbili.dfmnext.danmaku.model
 
+import kotlin.math.abs
+import kotlin.math.sqrt
+
 class SpecialDanmaku : BaseDanmaku() {
 
     data class Point(val x: Float, val y: Float) {
         fun getDistance(p: Point): Float {
-            val dx = Math.abs(this.x - p.x)
-            val dy = Math.abs(this.y - p.y)
-            return Math.sqrt((dx * dx + dy * dy).toDouble()).toFloat()
+            val dx = abs(this.x - p.x)
+            val dy = abs(this.y - p.y)
+            return sqrt(dx * dx + dy * dy)
         }
     }
 

@@ -1,7 +1,12 @@
 package io.github.ynotbili.dfmnext.danmaku.model.android
 
-import android.graphics.*
+import android.graphics.Camera
+import android.graphics.Canvas
+import android.graphics.Matrix
+import android.graphics.Paint
 import android.graphics.Paint.Style
+import android.graphics.RectF
+import android.graphics.Typeface
 import android.text.TextPaint
 import io.github.ynotbili.dfmnext.danmaku.model.AbsDisplayer
 import io.github.ynotbili.dfmnext.danmaku.model.BaseDanmaku
@@ -13,13 +18,35 @@ class AndroidDisplayer : AbsDisplayer() {
 
     private val camera = Camera()
     private val matrix = Matrix()
-    private var sLastScaleTextSize = 0f
-    private val sCachedScaleSize = HashMap<Float, Float>(10)
 
-    val UNDERLINE_HEIGHT = 4
+    private val UNDERLINE_HEIGHT = 4
 
+    /**
+     * Master paint carrying the user-facing style (typeface, fake bold, stroke
+     * width). Drawing never mutates it directly — each thread gets its own
+     * scratch copy via [obtainPaint].
+     */
     val PAINT: TextPaint = TextPaint().apply { strokeWidth = STROKE_WIDTH_F }
-    val PAINT_DUPLICATE: TextPaint = TextPaint(PAINT)
+
+    /**
+     * Per-thread scratch paint.
+     *
+     * Previously there was a single shared `PAINT_DUPLICATE` handed to whichever
+     * caller passed `quickly == false`, while the cache thread used `PAINT`.
+     * Because measuring runs on the cache thread and drawing runs on the UI
+     * thread at the same time, the shared duplicate could be reconfigured in the
+     * middle of another thread's draw — a real visual-corruption race, on top of
+     * the per-danmaku `TextPaint` churn the copy avoided.
+     */
+    private val scratchPaint = object : ThreadLocal<TextPaint>() {
+        override fun initialValue(): TextPaint = TextPaint(PAINT)
+    }
+
+    /** Scratch `RectF` so a rounded background no longer allocates per item. */
+    private val scratchRect = object : ThreadLocal<RectF>() {
+        override fun initialValue(): RectF = RectF()
+    }
+
     private val ALPHA_PAINT = Paint()
     private val UNDERLINE_PAINT = Paint().apply {
         strokeWidth = UNDERLINE_HEIGHT.toFloat()
@@ -32,13 +59,19 @@ class AndroidDisplayer : AbsDisplayer() {
     private val BACKGROUND_PAINT = Paint().apply { style = Style.FILL }
 
     var CONFIG_HAS_SHADOW = false
-    private var HAS_SHADOW = false
     var CONFIG_HAS_STROKE = true
-    private var HAS_STROKE = true
     var CONFIG_HAS_PROJECTION = false
-    private var HAS_PROJECTION = false
     val CONFIG_ANTI_ALIAS = true
-    private var ANTI_ALIAS = true
+
+    /**
+     * Effective flags. These were previously mutable instance state written by
+     * `drawDanmaku()` on the UI thread and read by the cache thread; they are now
+     * derived from the CONFIG_ values only, and the per-draw overrides travel as
+     * local variables.
+     */
+    private val hasShadow: Boolean get() = CONFIG_HAS_SHADOW
+    private val hasStrokeConfig: Boolean get() = CONFIG_HAS_STROKE
+    private val hasProjection: Boolean get() = CONFIG_HAS_PROJECTION
 
     private var sStuffer: BaseCacheStuffer = SimpleTextCacheStuffer()
     private var isTranslucent = false
@@ -51,6 +84,20 @@ class AndroidDisplayer : AbsDisplayer() {
     private var sProjectionOffsetX = 1.0f
     private var sProjectionOffsetY = 1.0f
     private var sProjectionAlpha = 0xCC
+
+    /**
+     * Text-size -> scaled-size lookup, per thread and bounded. The old shared
+     * `HashMap` grew without limit (one entry per distinct text size ever seen),
+     * leaked across config changes, and was read/written by two threads.
+     */
+    private val scaleCache = object : ThreadLocal<TextSizeScaleCache>() {
+        override fun initialValue(): TextSizeScaleCache = TextSizeScaleCache()
+    }
+
+    private class TextSizeScaleCache {
+        var factor = 1.0f
+        val sizes = HashMap<Float, Float>(8)
+    }
 
     private var _canvas: Canvas? = null
     private var _width = 0
@@ -141,6 +188,7 @@ class AndroidDisplayer : AbsDisplayer() {
         }
 
         if (alphaPaint != null && alphaPaint.alpha == BaseDanmaku.ALPHA_TRANSPARENT) {
+            if (needRestore) c.restore()
             return IRenderer.NOTHING_RENDERING
         }
 
@@ -153,10 +201,11 @@ class AndroidDisplayer : AbsDisplayer() {
             }
         }
         if (!cacheDrawn) {
+            val paint = obtainPaint()
             if (alphaPaint != null) {
-                PAINT.alpha = alphaPaint.alpha
+                paint.alpha = alphaPaint.alpha
             } else {
-                resetPaintAlpha(PAINT)
+                resetPaintAlpha(paint)
             }
             drawDanmaku(danmaku, c, left, top, false)
             result = IRenderer.TEXT_RENDERING
@@ -164,6 +213,13 @@ class AndroidDisplayer : AbsDisplayer() {
 
         if (needRestore) c.restore()
         return result
+    }
+
+    /** This thread's scratch paint, refreshed from the master style. */
+    private fun obtainPaint(): TextPaint {
+        val paint = scratchPaint.get()!!
+        paint.set(PAINT)
+        return paint
     }
 
     private fun resetPaintAlpha(paint: Paint) {
@@ -183,10 +239,9 @@ class AndroidDisplayer : AbsDisplayer() {
         return count
     }
 
-    @Synchronized
     override fun drawDanmaku(danmaku: BaseDanmaku, canvas: Canvas, left: Float, top: Float, quickly: Boolean) {
-        var _left = left
-        var _top = top
+        val _left = left
+        val _top = top
         var adjLeft = left + danmaku.padding
         var adjTop = top + danmaku.padding
         if (danmaku.borderColor != 0) {
@@ -194,65 +249,36 @@ class AndroidDisplayer : AbsDisplayer() {
             adjTop += BORDER_WIDTH
         }
 
-        HAS_STROKE = CONFIG_HAS_STROKE
-        HAS_SHADOW = CONFIG_HAS_SHADOW
-        HAS_PROJECTION = CONFIG_HAS_PROJECTION
-        ANTI_ALIAS = quickly && CONFIG_ANTI_ALIAS
-        val paint = getPaint(danmaku, quickly)
+        // Per-draw style state stays local: no shared mutable fields.
+        val projection = hasProjection
+        val strokeEnabled = hasStrokeConfig
+        val antiAlias = quickly && CONFIG_ANTI_ALIAS
+        val paint = getPaint(danmaku, quickly, antiAlias)
+        val strokeWidth = if (strokeEnabled || projection) STROKE_WIDTH else 0f
+
         sStuffer.drawBackground(danmaku, canvas, _left, _top)
 
         if (danmaku.backgroundColor != 0) {
             val bgPaint = getBackgroundPaint(danmaku)
-            val rect = RectF(_left, _top, _left + danmaku.paintWidth, _top + danmaku.paintHeight)
+            val rect = scratchRect.get()!!
+            rect.set(_left, _top, _left + danmaku.paintWidth, _top + danmaku.paintHeight)
             canvas.drawRoundRect(rect, danmaku.backgroundRadius.toFloat(), danmaku.backgroundRadius.toFloat(), bgPaint)
         }
 
         val lines = danmaku.lines
         if (lines != null) {
             if (lines.size == 1) {
-                if (hasStroke(danmaku)) {
-                    applyPaintConfig(danmaku, paint, true)
-                    var strokeLeft = adjLeft
-                    var strokeTop = adjTop - paint.ascent()
-                    if (HAS_PROJECTION) {
-                        strokeLeft += sProjectionOffsetX
-                        strokeTop += sProjectionOffsetY
-                    }
-                    sStuffer.drawStroke(danmaku, lines[0], canvas, strokeLeft, strokeTop, paint)
-                }
-                applyPaintConfig(danmaku, paint, false)
-                sStuffer.drawText(danmaku, lines[0], canvas, adjLeft, adjTop - paint.ascent(), paint, quickly)
+                drawLine(danmaku, lines[0], canvas, paint, adjLeft, adjTop, strokeWidth, projection, quickly)
             } else {
                 val textHeight = (danmaku.paintHeight - 2 * danmaku.padding) / lines.size
                 for (t in lines.indices) {
-                    if (lines[t].isNullOrEmpty()) continue
-                    if (hasStroke(danmaku)) {
-                        applyPaintConfig(danmaku, paint, true)
-                        var strokeLeft = adjLeft
-                        var strokeTop = t * textHeight + adjTop - paint.ascent()
-                        if (HAS_PROJECTION) {
-                            strokeLeft += sProjectionOffsetX
-                            strokeTop += sProjectionOffsetY
-                        }
-                        sStuffer.drawStroke(danmaku, lines[t], canvas, strokeLeft, strokeTop, paint)
-                    }
-                    applyPaintConfig(danmaku, paint, false)
-                    sStuffer.drawText(danmaku, lines[t], canvas, adjLeft, t * textHeight + adjTop - paint.ascent(), paint, quickly)
+                    val line = lines[t]
+                    if (line.isNullOrEmpty()) continue
+                    drawLine(danmaku, line, canvas, paint, adjLeft, adjTop + t * textHeight, strokeWidth, projection, quickly)
                 }
             }
         } else {
-            if (hasStroke(danmaku)) {
-                applyPaintConfig(danmaku, paint, true)
-                var strokeLeft = adjLeft
-                var strokeTop = adjTop - paint.ascent()
-                if (HAS_PROJECTION) {
-                    strokeLeft += sProjectionOffsetX
-                    strokeTop += sProjectionOffsetY
-                }
-                sStuffer.drawStroke(danmaku, null, canvas, strokeLeft, strokeTop, paint)
-            }
-            applyPaintConfig(danmaku, paint, false)
-            sStuffer.drawText(danmaku, null, canvas, adjLeft, adjTop - paint.ascent(), paint, quickly)
+            drawLine(danmaku, null, canvas, paint, adjLeft, adjTop, strokeWidth, projection, quickly)
         }
 
         if (danmaku.underlineColor != 0) {
@@ -267,8 +293,33 @@ class AndroidDisplayer : AbsDisplayer() {
         }
     }
 
-    private fun hasStroke(danmaku: BaseDanmaku): Boolean =
-        (HAS_STROKE || HAS_PROJECTION) && STROKE_WIDTH > 0 && danmaku.textShadowColor != 0
+    private fun drawLine(
+        danmaku: BaseDanmaku,
+        lineText: String?,
+        canvas: Canvas,
+        paint: TextPaint,
+        left: Float,
+        top: Float,
+        strokeWidth: Float,
+        projection: Boolean,
+        quickly: Boolean,
+    ) {
+        if (hasStroke(danmaku, strokeWidth)) {
+            applyPaintConfig(danmaku, paint, true, projection)
+            var strokeLeft = left
+            var strokeTop = top - paint.ascent()
+            if (projection) {
+                strokeLeft += sProjectionOffsetX
+                strokeTop += sProjectionOffsetY
+            }
+            sStuffer.drawStroke(danmaku, lineText, canvas, strokeLeft, strokeTop, paint)
+        }
+        applyPaintConfig(danmaku, paint, false, projection)
+        sStuffer.drawText(danmaku, lineText, canvas, left, top - paint.ascent(), paint, quickly)
+    }
+
+    private fun hasStroke(danmaku: BaseDanmaku, strokeWidth: Float): Boolean =
+        (hasStrokeConfig || hasProjection) && strokeWidth > 0 && danmaku.textShadowColor != 0
 
     private fun getBorderPaint(danmaku: BaseDanmaku): Paint {
         BORDER_PAINT.color = danmaku.borderColor
@@ -285,30 +336,27 @@ class AndroidDisplayer : AbsDisplayer() {
         return BACKGROUND_PAINT
     }
 
-    @Synchronized
-    private fun getPaint(danmaku: BaseDanmaku, fromWorkerThread: Boolean): TextPaint {
-        val paint = if (fromWorkerThread) {
-            PAINT
-        } else {
-            PAINT_DUPLICATE.apply { set(PAINT) }
-        }
+    private fun getPaint(danmaku: BaseDanmaku, quickly: Boolean, antiAlias: Boolean): TextPaint {
+        // Always the thread-confined scratch paint: the cache thread and the UI
+        // thread can never observe each other's configuration.
+        val paint = obtainPaint()
         paint.textSize = danmaku.textSize
         applyTextScaleConfig(danmaku, paint)
-        if (!HAS_SHADOW || SHADOW_RADIUS <= 0 || danmaku.textShadowColor == 0) {
+        if (!hasShadow || SHADOW_RADIUS <= 0 || danmaku.textShadowColor == 0) {
             paint.clearShadowLayer()
         } else {
             paint.setShadowLayer(SHADOW_RADIUS, 0f, 0f, danmaku.textShadowColor)
         }
-        paint.isAntiAlias = ANTI_ALIAS
+        paint.isAntiAlias = antiAlias
         return paint
     }
 
-    private fun applyPaintConfig(danmaku: BaseDanmaku, paint: Paint, stroke: Boolean) {
+    private fun applyPaintConfig(danmaku: BaseDanmaku, paint: Paint, stroke: Boolean, projection: Boolean) {
         if (isTranslucent) {
             if (stroke) {
-                paint.style = if (HAS_PROJECTION) Style.FILL else Style.STROKE
+                paint.style = if (projection) Style.FILL else Style.STROKE
                 paint.color = danmaku.textShadowColor and 0x00FFFFFF
-                paint.alpha = if (HAS_PROJECTION) {
+                paint.alpha = if (projection) {
                     (sProjectionAlpha * (transparency.toFloat() / BaseDanmaku.ALPHA_MAX)).toInt()
                 } else transparency
             } else {
@@ -318,9 +366,9 @@ class AndroidDisplayer : AbsDisplayer() {
             }
         } else {
             if (stroke) {
-                paint.style = if (HAS_PROJECTION) Style.FILL else Style.STROKE
+                paint.style = if (projection) Style.FILL else Style.STROKE
                 paint.color = danmaku.textShadowColor and 0x00FFFFFF
-                paint.alpha = if (HAS_PROJECTION) sProjectionAlpha else BaseDanmaku.ALPHA_MAX
+                paint.alpha = if (projection) sProjectionAlpha else BaseDanmaku.ALPHA_MAX
             } else {
                 paint.style = Style.FILL
                 paint.color = danmaku.textColor and 0x00FFFFFF
@@ -331,21 +379,22 @@ class AndroidDisplayer : AbsDisplayer() {
 
     private fun applyTextScaleConfig(danmaku: BaseDanmaku, paint: Paint) {
         if (!isTextScaled) return
-        var size = sCachedScaleSize[danmaku.textSize]
-        if (size == null || sLastScaleTextSize != scaleTextSize) {
-            sLastScaleTextSize = scaleTextSize
-            size = danmaku.textSize * scaleTextSize
-            sCachedScaleSize[danmaku.textSize] = size
+        val cache = scaleCache.get()!!
+        if (cache.factor != scaleTextSize) {
+            cache.factor = scaleTextSize
+            cache.sizes.clear()
         }
+        val size = cache.sizes[danmaku.textSize]
+            ?: (danmaku.textSize * scaleTextSize).also { cache.sizes[danmaku.textSize] = it }
         paint.textSize = size
     }
 
     override fun measure(danmaku: BaseDanmaku, fromWorkerThread: Boolean) {
-        val paint = getPaint(danmaku, fromWorkerThread)
-        if (HAS_STROKE) applyPaintConfig(danmaku, paint, true)
+        val paint = getPaint(danmaku, fromWorkerThread, CONFIG_ANTI_ALIAS)
+        if (hasStrokeConfig) applyPaintConfig(danmaku, paint, true, hasProjection)
         sStuffer.measure(danmaku, paint, fromWorkerThread)
         setDanmakuPaintWidthAndHeight(danmaku, danmaku.paintWidth, danmaku.paintHeight)
-        if (HAS_STROKE) applyPaintConfig(danmaku, paint, false)
+        if (hasStrokeConfig) applyPaintConfig(danmaku, paint, false, hasProjection)
     }
 
     private fun setDanmakuPaintWidthAndHeight(danmaku: BaseDanmaku, w: Float, h: Float) {
@@ -361,7 +410,10 @@ class AndroidDisplayer : AbsDisplayer() {
 
     override fun clearTextHeightCache() {
         sStuffer.clearCaches()
-        sCachedScaleSize.clear()
+        scaleCache.get()?.let {
+            it.factor = 0f
+            it.sizes.clear()
+        }
     }
 
     override fun resetSlopPixel(factor: Float) {
@@ -406,9 +458,9 @@ class AndroidDisplayer : AbsDisplayer() {
 
     override val strokeWidth: Float
         get() = when {
-            HAS_SHADOW && HAS_STROKE -> maxOf(SHADOW_RADIUS, STROKE_WIDTH)
-            HAS_SHADOW -> SHADOW_RADIUS
-            HAS_STROKE -> STROKE_WIDTH
+            CONFIG_HAS_SHADOW && CONFIG_HAS_STROKE -> maxOf(SHADOW_RADIUS, STROKE_WIDTH)
+            CONFIG_HAS_SHADOW -> SHADOW_RADIUS
+            CONFIG_HAS_STROKE -> STROKE_WIDTH
             else -> 0f
         }
 

@@ -14,7 +14,10 @@ class DanmakuTouchHelper private constructor(
     private val mDanmakuBounds = RectF()
 
     fun onTouchEvent(event: MotionEvent): Boolean {
-        when (event.action) {
+        // `actionMasked` rather than `action`: with a second finger down the raw
+        // action carries the pointer index in its high bits, so comparing it
+        // against ACTION_UP only works by accident.
+        when (event.actionMasked) {
             MotionEvent.ACTION_UP -> {
                 val clickDanmakus = touchHitDanmaku(event.x, event.y)
                 var newestDanmaku: BaseDanmaku? = null

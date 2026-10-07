@@ -47,14 +47,20 @@ class AndroidFileSource : IDataSource<InputStream> {
         ) {
             fillStreamFromHttpFile(uri)
         } else if (IDataSource.SCHEME_FILE_TAG.equals(scheme, ignoreCase = true)) {
-            fillStreamFromFile(File(uri.path))
+            // Uri.path is nullable, so File(uri.path) used to compile only through
+            // a platform-type waiver and threw a KotlinNpe-style failure on opaque
+            // uris. Return early instead.
+            val path = uri.path ?: return
+            fillStreamFromFile(File(path))
         }
     }
 
     fun fillStreamFromHttpFile(uri: Uri) {
+        // An http(s) Uri always carries its value in the authority + path, so the
+        // old `URL(uri.path)` call reconstructed the endpoint from a partial
+        // string. `uri.toString()` is the complete, already-encoded form.
         try {
-            val url = URL(uri.path)
-            url.openConnection()
+            val url = URL(uri.toString())
             inStream = BufferedInputStream(url.openStream())
         } catch (e: MalformedURLException) {
             // Invalid URL

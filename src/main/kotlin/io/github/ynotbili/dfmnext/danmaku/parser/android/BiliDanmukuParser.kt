@@ -1,6 +1,7 @@
 package io.github.ynotbili.dfmnext.danmaku.parser.android
 
 import android.graphics.Color
+import android.util.Xml
 import io.github.ynotbili.dfmnext.danmaku.model.BaseDanmaku
 import io.github.ynotbili.dfmnext.danmaku.model.IDisplayer
 import io.github.ynotbili.dfmnext.danmaku.model.SpecialDanmaku
@@ -10,142 +11,161 @@ import io.github.ynotbili.dfmnext.danmaku.parser.BaseDanmakuParser
 import io.github.ynotbili.dfmnext.danmaku.util.DanmakuUtils
 import io.github.ynotbili.dfmnext.danmaku.util.isSpecial
 import org.json.JSONArray
-import org.xml.sax.Attributes
-import org.xml.sax.InputSource
-import org.xml.sax.helpers.DefaultHandler
-import org.xml.sax.helpers.XMLReaderFactory
-import java.util.Locale
+import org.xmlpull.v1.XmlPullParser
+import java.io.InputStream
 
+/**
+ * Parses the legacy Bilibili `xml` danmaku format.
+ *
+ * Previously this went through `XMLReaderFactory.createXMLReader()` plus a
+ * `org.xml.sax.driver` system property set in a companion initializer. That
+ * factory is removed from newer Android platform versions and relies on a
+ * global side effect; `android.util.Xml.newPullParser()` is the supported,
+ * allocation-light API and is what the platform's own SAX driver wraps anyway.
+ *
+ * Danmakus are collected in arrival order and sorted once at the end
+ * ([Danmakus.setItems]) instead of being inserted into a sorted container one by
+ * one — for a 10k-comment file that is one `sortWith` pass instead of 10k
+ * binary-search insertions.
+ */
 class BiliDanmukuParser : BaseDanmakuParser() {
 
     private var mDispScaleX: Float = 0f
     private var mDispScaleY: Float = 0f
 
-    companion object {
-        init {
-            System.setProperty("org.xml.sax.driver", "org.xmlpull.v1.sax2.Driver")
-        }
-    }
-
     override fun parse(): Danmakus? {
-        if (mDataSource != null) {
-            val source = mDataSource as AndroidFileSource
-            try {
-                val xmlReader = XMLReaderFactory.createXMLReader()
-                val contentHandler = XmlContentHandler()
-                xmlReader.contentHandler = contentHandler
-                xmlReader.parse(InputSource(source.data()))
-                return contentHandler.result
-            } catch (e: Exception) {
-                // XML parse error, skip
-            }
+        val source = mDataSource ?: return null
+        val input = source.data() as? InputStream ?: return null
+        val collected = ArrayList<BaseDanmaku>(1024)
+        return try {
+            parse(input, collected)
+        } catch (_: Exception) {
+            // Malformed XML: whatever was parsed up to the failure is still usable.
+            if (collected.isEmpty()) null else Danmakus().apply { setItems(collected) }
         }
-        return null
     }
 
-    private inner class XmlContentHandler : DefaultHandler() {
+    private fun parse(input: InputStream, collected: ArrayList<BaseDanmaku>): Danmakus {
+        // android.util.Xml.newPullParser() already has namespace processing off,
+        // so `d` comes back as the raw tag name and no feature call is needed.
+        val parser = Xml.newPullParser()
+        parser.setInput(input, null)
 
-        var result: Danmakus? = null
         var item: BaseDanmaku? = null
-        var completed: Boolean = false
-        var index: Int = 0
+        var index = 0
 
-        override fun startDocument() {
-            result = Danmakus()
-        }
-
-        override fun endDocument() {
-            completed = true
-        }
-
-        override fun startElement(uri: String, localName: String, qName: String, attributes: Attributes) {
-            var tagName = if (localName.isNotEmpty()) localName else qName
-            tagName = tagName.lowercase(Locale.getDefault()).trim()
-            if (tagName == "d") {
-                val pValue = attributes.getValue("p")
-                val values = pValue.split(",")
-                if (values.isNotEmpty()) {
-                    val time = (values[0].toFloat() * 1000).toLong()
-                    var type = values[1].toInt()
-
-                    val enableAdvanced = sharedPreferences == null ||
-                        sharedPreferences!!.getBoolean("player_danmaku_advanced_enable", true)
-                    if (!enableAdvanced && (type == 7 || type == 8)) {
-                        type = 1
-                    }
-                    if (sharedPreferences != null && type != 7 && type != 8 &&
-                        sharedPreferences!!.getBoolean("player_danmaku_forceR2L", false)
-                    ) {
-                        type = 1
+        while (true) {
+            val event = parser.next()
+            if (event == XmlPullParser.END_DOCUMENT) break
+            when (event) {
+                XmlPullParser.START_TAG ->
+                    if (parser.name == TAG_DANMAKU) {
+                        // Assign unconditionally: if the attributes are unusable the
+                        // pending item must be dropped, otherwise the following TEXT
+                        // event would write this element's content into the previous
+                        // danmaku.
+                        item = readAttributes(parser)
                     }
 
-                    val textSize = values[2].toFloat()
-                    val color = values[3].toInt() or -0x1000000
-                    item = mContext.mDanmakuFactory.createDanmaku(type, mContext)
-                    item?.apply {
-                        this.time = time
-                        this.textSize = textSize * (mDispDensity - 0.6f)
-                        textColor = color
-                        textShadowColor = if (color <= Color.BLACK) Color.WHITE else Color.BLACK
-                    }
+                XmlPullParser.TEXT -> {
+                    val danmaku = item ?: continue
+                    val raw = decodeXmlString(parser.text ?: "")
+                    DanmakuUtils.fillText(danmaku, unwrapAdvancedPayload(raw))
+                    danmaku.index = index++
+                    if (!prepareContent(danmaku)) item = null
                 }
-            }
-        }
 
-        override fun endElement(uri: String, localName: String, qName: String) {
-            item?.let { danmaku ->
-                if (danmaku.duration != null) {
-                    val tagName = if (localName.isNotEmpty()) localName else qName
-                    if (tagName.equals("d", ignoreCase = true)) {
+                XmlPullParser.END_TAG -> {
+                    if (parser.name != TAG_DANMAKU) continue
+                    val danmaku = item ?: continue
+                    if (danmaku.duration != null) {
                         danmaku.setTimer(mTimer)
-                        result?.let { it += danmaku }
+                        collected.add(danmaku)
                     }
-                }
-                item = null
-            }
-        }
-
-        override fun characters(ch: CharArray, start: Int, length: Int) {
-            item?.let { danmaku ->
-                var rawText = decodeXmlString(String(ch, start, length))
-                val enableAdvanced = sharedPreferences == null ||
-                    sharedPreferences!!.getBoolean("player_danmaku_advanced_enable", true)
-                if (!enableAdvanced && rawText.startsWith("[") && rawText.endsWith("]")) {
-                    try {
-                        val jsonArray = JSONArray(rawText)
-                        if (jsonArray.length() >= 5) {
-                            rawText = jsonArray.getString(4)
-                        }
-                    } catch (_: Exception) {}
-                }
-                DanmakuUtils.fillText(danmaku, rawText)
-                danmaku.index = index++
-
-                val text = danmaku.text?.toString()?.trim() ?: ""
-                if (danmaku.isSpecial) {
-                    val textArr = SpecialDanmakuParser.parseFromJson(text)
-                    if (textArr != null && textArr.size >= 5) {
-                        SpecialDanmakuParser.parse(danmaku as SpecialDanmaku, textArr, mContext, mDispScaleX, mDispScaleY)
-                    } else {
-                        item = null
-                        return
-                    }
+                    item = null
                 }
             }
         }
+        return Danmakus().apply { setItems(collected) }
+    }
 
-        private fun decodeXmlString(title: String): String {
-            var result = title
-            if (result.contains("&amp;")) result = result.replace("&amp;", "&")
-            if (result.contains("&quot;")) result = result.replace("&quot;", "\"")
-            if (result.contains("&gt;")) result = result.replace("&gt;", ">")
-            if (result.contains("&lt;")) result = result.replace("&lt;", "<")
-            return result
+    private fun readAttributes(parser: XmlPullParser): BaseDanmaku? {
+        val encoded = parser.getAttributeValue(null, "p") ?: return null
+        // The parameter string is `time,type,size,color,...` — read it by index
+        // instead of split(), which allocates an array plus a substring per field.
+        var cursor = 0
+        val fields = arrayOfNulls<String>(FIELD_COUNT)
+        for (i in 0 until FIELD_COUNT) {
+            val next = encoded.indexOf(',', cursor)
+            if (next < 0) {
+                fields[i] = encoded.substring(cursor)
+                cursor = encoded.length
+            } else {
+                fields[i] = encoded.substring(cursor, next)
+                cursor = next + 1
+            }
+        }
+        val timeField = fields[0] ?: return null
+        val typeField = fields[1] ?: return null
+        val sizeField = fields[2] ?: return null
+        val colorField = fields[3] ?: return null
+
+        val type: Int
+        val time: Long
+        val textSize: Float
+        val color: Int
+        try {
+            type = typeField.toInt()
+            time = (timeField.toFloat() * 1000).toLong()
+            textSize = sizeField.toFloat()
+            color = colorField.toInt() or -0x1000000
+        } catch (_: NumberFormatException) {
+            return null
+        }
+
+        val created = mContext.mDanmakuFactory.createDanmaku(resolveMode(type), mContext)
+            ?: return null
+        created.time = time
+        created.textSize = textSize * (mDispDensity - 0.6f)
+        created.textColor = color
+        created.textShadowColor = if (color <= Color.BLACK) Color.WHITE else Color.BLACK
+        return created
+    }
+
+    /**
+     * When advanced rendering is off, an animated danmaku's payload is a JSON
+     * array whose element 4 is the plain text.
+     */
+    private fun unwrapAdvancedPayload(raw: String): String {
+        if (!isAdvancedPayload(raw)) return raw
+        return try {
+            val array = JSONArray(raw)
+            if (array.length() >= 5) array.getString(4) else raw
+        } catch (_: Exception) {
+            raw
         }
     }
 
-    private fun isPercentageNumber(number: Float): Boolean {
-        return number in 0f..1f
+    /** Returns false when the item must be discarded (a broken special danmaku). */
+    private fun prepareContent(danmaku: BaseDanmaku): Boolean {
+        if (!danmaku.isSpecial) return true
+        val text = danmaku.text?.toString()?.trim() ?: return false
+        val frames = SpecialDanmakuParser.parseFromJson(text) ?: return false
+        if (frames.size < 5) return false
+        SpecialDanmakuParser.parse(
+            danmaku as SpecialDanmaku, frames, mContext, mDispScaleX, mDispScaleY
+        )
+        return true
+    }
+
+    private fun decodeXmlString(title: String): String {
+        if (title.indexOf('&') < 0) return title
+        var result = title
+        if (result.contains("&amp;")) result = result.replace("&amp;", "&")
+        if (result.contains("&quot;")) result = result.replace("&quot;", "\"")
+        if (result.contains("&gt;")) result = result.replace("&gt;", ">")
+        if (result.contains("&lt;")) result = result.replace("&lt;", "<")
+        return result
     }
 
     override fun setDisplayer(disp: IDisplayer): BaseDanmakuParser {
@@ -153,5 +173,10 @@ class BiliDanmukuParser : BaseDanmakuParser() {
         mDispScaleX = mDispWidth / DanmakuFactory.BILI_PLAYER_WIDTH
         mDispScaleY = mDispHeight / DanmakuFactory.BILI_PLAYER_HEIGHT
         return this
+    }
+
+    private companion object {
+        const val TAG_DANMAKU = "d"
+        const val FIELD_COUNT = 4
     }
 }
